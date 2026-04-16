@@ -15,7 +15,7 @@ import struct
 import sys
 import unittest
 
-_PYGOST_PATH = "/path/topygost"
+_PYGOST_PATH = "/Users/justinpage/Documents/Vault/testing/pygost"
 if not os.path.isdir(_PYGOST_PATH):
     raise RuntimeError(
         f"pygost source not found at {_PYGOST_PATH}. "
@@ -825,7 +825,8 @@ class TestSyntheticE2E(unittest.TestCase):
 
         # 4. KEG_256 (RFC 9189 §8.3.1): H = HASH(r_c || r_s)
         H = GOST34112012256(r_c + r_s).digest()
-        UKM_int = int.from_bytes(H[0:8], "little")        # INT(H[1..8], LE) per RFC 9189 §8.3.1
+        # RFC 9189 §8.3.1: r = INT(H[1..16], BE); if r=0 UKM=1 else UKM=r
+        UKM_int = int.from_bytes(H[0:16], "big") or 1
         seed_keg = H[16:24]                               # H[17..24]
         IV_wrap  = H[24:28]                               # H[25..28] for Magma
 
@@ -959,6 +960,82 @@ class TestSyntheticE2E(unittest.TestCase):
         
         if os.path.exists(pcap_file):
             os.remove(pcap_file)
+
+    def test_magma_ctr_omac_full_handshake_ems(self):
+        """EMS path (RFC 7627): PRF with 'extended master secret' + session_hash
+        produces a different MS than the non-EMS path, and the derived keys
+        correctly encrypt and decrypt a record."""
+        from os import urandom
+
+        curve = CURVES["id-GostR3410-2001-CryptoPro-A-ParamSet"]
+        bs = 8
+
+        # 1. Server static keypair, client ephemeral keypair
+        d_s = prv_unmarshal(urandom(32)) % curve.q or 1
+        Q_s = public_key(curve, d_s)
+        d_eph = prv_unmarshal(urandom(32)) % curve.q or 1
+        Q_eph = public_key(curve, d_eph)
+
+        # 2. Hello randoms
+        r_c = urandom(32)
+        r_s = urandom(32)
+
+        # 3. KEG_256 — same as non-EMS path
+        H = GOST34112012256(r_c + r_s).digest()
+        UKM_int = int.from_bytes(H[0:16], "big") or 1
+        seed_keg = H[16:24]
+        IV_wrap  = H[24:28]
+
+        K_EXP_c = kek_34102012256(curve, d_eph, Q_s,  UKM_int)
+        K_EXP_s = kek_34102012256(curve, d_s,   Q_eph, UKM_int)
+        self.assertEqual(K_EXP_c, K_EXP_s)
+
+        K_Exp_MAC, K_Exp_ENC = kdftree_256(K_EXP_c, b"kdf tree", seed_keg)
+
+        # 4. Wrap/unwrap PMS
+        PMS = urandom(32)
+        PMSEXP = kexp15(PMS, K_Exp_MAC, K_Exp_ENC, IV_wrap, GOST3412Magma, bs=bs)
+        PMS_recovered = kimp15(PMSEXP, K_Exp_MAC, K_Exp_ENC, IV_wrap, GOST3412Magma, bs=bs)
+        self.assertEqual(PMS_recovered, PMS)
+
+        # 5. Synthetic handshake transcript: stands in for CH+SH+SKE+CKE messages.
+        #    Content doesn't need to be valid TLS — just non-empty and deterministic.
+        handshake_transcript = r_c + r_s + PMSEXP  # fake but non-trivial bytes
+
+        # 6. EMS master secret
+        session_hash = GOST34112012256(handshake_transcript).digest()
+        MS_ems = prf_tls_gost(PMS, b"extended master secret", session_hash, 48)
+
+        # 7. Non-EMS master secret (same PMS, different label+seed)
+        MS_plain = prf_tls_gost(PMS, b"master secret", r_c + r_s, 48)
+
+        # EMS and non-EMS must produce different master secrets
+        self.assertNotEqual(MS_ems, MS_plain, "EMS and non-EMS MS must differ")
+
+        # 8. Derive key material from EMS master secret
+        km = prf_tls_gost(MS_ems, b"key expansion", r_s + r_c, 136)
+        cw_mac = km[0:32]
+        cw_enc = km[64:96]
+        cw_iv  = km[128:132]
+
+        # 9. Encrypt a record with EMS-derived keys
+        plaintext = b"ems test record"
+        seqnum = 0
+        K_MAC = tlstree(cw_mac, seqnum, MAGMA_C1, MAGMA_C2, MAGMA_C3)
+        K_ENC = tlstree(cw_enc, seqnum, MAGMA_C1, MAGMA_C2, MAGMA_C3)
+        length_be = struct.pack(">H", len(plaintext))
+        mac_input = struct.pack(">Q", seqnum) + b"\x17\x03\x03" + length_be + plaintext
+        mac = gost3413_mac(GOST3412Magma(K_MAC).encrypt, bs, mac_input)
+        ciphertext = gost3413_ctr(GOST3412Magma(K_ENC).encrypt, bs,
+                                  plaintext + mac, cw_iv)
+
+        # 10. Decrypt and verify MAC
+        decrypted = gost3413_ctr(GOST3412Magma(K_ENC).encrypt, bs, ciphertext, cw_iv)
+        recovered_plain = decrypted[:-bs]
+        recovered_mac   = decrypted[-bs:]
+        expected_mac = gost3413_mac(GOST3412Magma(K_MAC).encrypt, bs, mac_input)
+        self.assertEqual(recovered_mac,   expected_mac, "EMS record MAC mismatch")
+        self.assertEqual(recovered_plain, plaintext,    "EMS record plaintext mismatch")
 
 
 if __name__ == "__main__":
